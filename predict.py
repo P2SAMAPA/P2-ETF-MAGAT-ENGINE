@@ -6,6 +6,7 @@
 import argparse
 import json
 import os
+import pickle
 from datetime import datetime
 
 import numpy as np
@@ -15,6 +16,7 @@ import torch
 
 import config as cfg
 import loader
+import features as feat
 from model import MAGAT
 
 DEVICE = torch.device("cpu")
@@ -29,84 +31,106 @@ def next_trading_day(from_date: str = None) -> str:
     )
     days = mcal.date_range(schedule, frequency="1D").normalize().tz_localize(None)
     future = [d for d in days if d > base]
-    return str(future[0].date()) if future else \
-           str((base + pd.Timedelta(days=1)).date())
+    return str(future[0].date()) if future else str((base + pd.Timedelta(days=1)).date())
 
 
 def _load_magat(model_path: str, meta: dict) -> MAGAT:
+    """Load MAGAT model from checkpoint — auto-detects architecture from meta."""
     cfg_m = meta.get("config", {})
     model = MAGAT(
         n_assets=meta["n_assets"],
-        state_dim=meta["n_asset_feats"] * cfg_m.get("lookback", cfg.LOOKBACK),
-        n_macro=meta["n_macro_feats"],
+        n_asset_feats=meta["n_asset_feats"],
+        n_macro_feats=meta["n_macro_feats"],
+        lookback=cfg_m.get("lookback", cfg.LOOKBACK),
         gat_hidden=cfg_m.get("gat_hidden", cfg.GAT_HIDDEN_DIM),
         gat_heads=cfg_m.get("gat_heads", cfg.GAT_N_HEADS),
         gat_layers=cfg_m.get("gat_layers", cfg.GAT_N_LAYERS),
-        dqn_hidden=cfg_m.get("dqn_hidden", cfg.DQN_HIDDEN_DIM),
-        meta_hidden=cfg.META_HIDDEN_DIM,
+        macro_hidden=cfg_m.get("macro_hidden", cfg.MACRO_HIDDEN_DIM),
+        port_hidden=cfg_m.get("port_hidden", cfg.PORT_HIDDEN_DIM),
         dropout=0.0,
     ).to(DEVICE)
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    state = torch.load(model_path, map_location=DEVICE)
+    model.load_state_dict(state)
     model.eval()
     return model
 
 
-def _get_last_state(data: dict, meta: dict) -> tuple:
-    """Get last LOOKBACK-day state for inference."""
-    lookback = meta.get("config", {}).get("lookback", cfg.LOOKBACK)
-    ohlcv    = data["ohlcv_feat"]
-    macro    = data["macro_feat"]
+def _build_inference_input(data: dict, meta: dict) -> tuple:
+    """Build last-window inference tensors."""
+    lookback = meta.get("lookback", cfg.LOOKBACK)
+    tickers  = meta["tickers"]
 
-    # Last window
-    window   = ohlcv[-lookback:]                          # (L, A, F)
-    asset_states = window.transpose(1, 0, 2).reshape(
-        data["n_assets"], lookback * data["n_asset_feats"]
-    ).astype(np.float32)
-    macro_state = macro[-1].astype(np.float32)
+    asset_feat = feat.build_asset_features(data["returns"], data["vol"])
+    macro_feat = feat.build_macro_features(data["macro"], data["macro_derived"])
 
-    last_date = str(data["index"][-1].date())
-    return asset_states, macro_state, last_date
+    common = asset_feat.index.intersection(macro_feat.index)
+    af = asset_feat.reindex(common).ffill().fillna(0.0)
+    mf = macro_feat.reindex(common).ffill().fillna(0.0)
+
+    asset_col_map = []
+    for t in tickers:
+        cols = [c for c in af.columns if c.startswith(f"{t}_")]
+        asset_col_map.append([af.columns.get_loc(c) for c in cols])
+
+    n_assets      = len(tickers)
+    n_asset_feats = len(asset_col_map[0])
+    af_w = af.iloc[-lookback:].values
+    mf_w = mf.iloc[-lookback:].values
+
+    X_asset = np.zeros((1, n_assets, lookback, n_asset_feats), dtype=np.float32)
+    X_macro = mf_w[np.newaxis, :, :].astype(np.float32)
+
+    for a, col_idxs in enumerate(asset_col_map):
+        X_asset[0, a] = af_w[:, col_idxs]
+
+    last_date = str(af.index[-1].date())
+    return X_asset, X_macro, last_date
 
 
-def generate_signal(option: str, data: dict) -> dict:
+def _run_inference(model: MAGAT, scaler, X_asset, X_macro,
+                   tickers: list) -> tuple:
+    X_asset_s, X_macro_s = scaler.transform(X_asset, X_macro)
+    with torch.no_grad():
+        weights = model(
+            torch.tensor(X_asset_s), torch.tensor(X_macro_s)
+        ).numpy()[0]
+
+    pick_idx   = int(np.argmax(weights))
+    pick       = tickers[pick_idx]
+    conviction = float(weights[pick_idx])
+    weights_dict = {tickers[i]: round(float(weights[i]), 4)
+                    for i in range(len(tickers))}
+    return pick, conviction, weights_dict
+
+
+def generate_signal(option: str, master: pd.DataFrame) -> dict:
     print(f"\n[predict] Generating fixed split signal for Option {option}...")
 
-    model_path = os.path.join(cfg.MODELS_DIR, f"magat_option{option}_best.pt")
-    meta_path  = os.path.join(cfg.MODELS_DIR, f"meta_option{option}.json")
+    model_path  = os.path.join(cfg.MODELS_DIR, f"magat_option{option}_best.pt")
+    meta_path   = os.path.join(cfg.MODELS_DIR, f"meta_option{option}.json")
+    scaler_path = os.path.join(cfg.MODELS_DIR, f"scaler_option{option}.pkl")
 
     if not os.path.exists(model_path):
         print(f"  No model found — run train.py first.")
         return None
 
-    with open(meta_path) as f:
-        meta = json.load(f)
+    with open(meta_path)    as f: meta   = json.load(f)
+    with open(scaler_path, "rb") as f: scaler = pickle.load(f)
 
-    model = _load_magat(model_path, meta)
-    asset_states, macro_state, last_date = _get_last_state(data, meta)
+    data          = loader.get_option_data(option, master)
+    model         = _load_magat(model_path, meta)
+    X_asset, X_macro, last_date = _build_inference_input(data, meta)
+    pick, conviction, weights   = _run_inference(model, scaler, X_asset,
+                                                  X_macro, meta["tickers"])
     signal_date = next_trading_day(last_date)
 
-    with torch.no_grad():
-        out = model(
-            torch.tensor(asset_states),
-            torch.tensor(macro_state),
-        )
+    rc = data["macro"].iloc[-1]
+    regime_context = {
+        k: round(float(rc.get(k, 0)), 3)
+        for k in ["VIX", "T10Y2Y", "HY_SPREAD", "USD_INDEX"]
+    }
 
-    tickers    = data["tickers"]
-    pick       = tickers[out["pick"]]
-    conviction = float(out["weights"][out["pick"]])
-    weights    = {tickers[i]: round(float(out["weights"][i]), 4)
-                  for i in range(len(tickers))}
-    active     = {tickers[i]: bool(out["active"][i])
-                  for i in range(len(tickers))}
-
-    rc = data["macro_feat"][-1]
-    macro_keys = cfg.MACRO_VARS[:data["n_macro_feats"]]
-    regime_context = {k: round(float(rc[i]), 3)
-                      for i, k in enumerate(macro_keys)}
-
-    print(f"  Option {option}: {pick} (conviction={conviction:.1%}) | "
-          f"active_agents={sum(active.values())}/{len(tickers)}")
-
+    print(f"  Option {option}: {pick} (conviction={conviction:.1%}) for {signal_date}")
     return {
         "option":          option,
         "mode":            "fixed_split",
@@ -117,57 +141,43 @@ def generate_signal(option: str, data: dict) -> dict:
         "pick":            pick,
         "conviction":      round(conviction, 4),
         "weights":         weights,
-        "active_agents":   active,
         "regime_context":  regime_context,
         "trained_at":      meta.get("trained_at", ""),
+        "winning_loss":    meta.get("winning_loss", ""),
         "test_ann_return": meta.get("test_ann_return", 0),
-        "test_ann_vol":    meta.get("test_ann_vol", 0),
         "test_sharpe":     meta.get("test_sharpe", 0),
-        "test_hit_rate":   meta.get("test_hit_rate", 0),
-        "test_n_trades":   meta.get("test_n_trades", 0),
         "test_start":      meta.get("test_start", ""),
-        "trading_cost_bps":meta.get("trading_cost_bps", cfg.TRADING_COST_BPS),
         "model_n_params":  meta.get("n_params", 0),
     }
 
 
-def generate_window_signal(option: str, data: dict) -> dict:
+def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
     print(f"\n[predict] Generating window signal for Option {option}...")
 
-    model_path = os.path.join(cfg.MODELS_DIR,
-                              f"magat_option{option}_window_best.pt")
-    meta_path  = os.path.join(cfg.MODELS_DIR,
-                              f"meta_option{option}_window.json")
+    model_path  = os.path.join(cfg.MODELS_DIR,
+                               f"magat_option{option}_window_best.pt")
+    meta_path   = os.path.join(cfg.MODELS_DIR,
+                               f"meta_option{option}_window.json")
+    scaler_path = os.path.join(cfg.MODELS_DIR,
+                               f"scaler_option{option}_window.pkl")
 
     if not os.path.exists(model_path):
-        print(f"  No window model — run train_windows.py first.")
+        print(f"  No window model found — run train_windows.py first.")
         return None
 
-    with open(meta_path) as f:
-        meta = json.load(f)
+    with open(meta_path)    as f: meta   = json.load(f)
+    with open(scaler_path, "rb") as f: scaler = pickle.load(f)
 
-    model = _load_magat(model_path, meta)
-    asset_states, macro_state, last_date = _get_last_state(data, meta)
+    data          = loader.get_option_data(option, master)
+    model         = _load_magat(model_path, meta)
+    X_asset, X_macro, last_date = _build_inference_input(data, meta)
+    pick, conviction, weights   = _run_inference(model, scaler, X_asset,
+                                                  X_macro, meta["tickers"])
     signal_date = next_trading_day(last_date)
-
-    with torch.no_grad():
-        out = model(
-            torch.tensor(asset_states),
-            torch.tensor(macro_state),
-        )
-
-    tickers    = data["tickers"]
-    pick       = tickers[out["pick"]]
-    conviction = float(out["weights"][out["pick"]])
-    weights    = {tickers[i]: round(float(out["weights"][i]), 4)
-                  for i in range(len(tickers))}
-    active     = {tickers[i]: bool(out["active"][i])
-                  for i in range(len(tickers))}
 
     print(f"  Option {option} window: {pick} (conviction={conviction:.1%}) | "
           f"Window {meta['winning_window']}: "
           f"{meta['winning_train_start']}→{meta['winning_train_end']}")
-
     return {
         "option":              option,
         "mode":                "shrinking_window",
@@ -178,32 +188,30 @@ def generate_window_signal(option: str, data: dict) -> dict:
         "pick":                pick,
         "conviction":          round(conviction, 4),
         "weights":             weights,
-        "active_agents":       active,
         "trained_at":          meta.get("trained_at", ""),
         "winning_window":      meta.get("winning_window", 0),
         "winning_train_start": meta.get("winning_train_start", ""),
         "winning_train_end":   meta.get("winning_train_end", ""),
+        "winning_loss":        meta.get("winning_loss", ""),
         "oos_ann_return":      meta.get("oos_ann_return", 0),
         "oos_ann_vol":         meta.get("oos_ann_vol", 0),
         "oos_sharpe":          meta.get("oos_sharpe", 0),
         "oos_hit_rate":        meta.get("oos_hit_rate", 0),
-        "oos_n_trades":        meta.get("oos_n_trades", 0),
-        "trading_cost_bps":    meta.get("trading_cost_bps", cfg.TRADING_COST_BPS),
+        "oos_max_dd":          meta.get("oos_max_dd", 0),
     }
 
 
 def update_history(signal: dict, option: str) -> None:
-    path    = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
+    path = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
     history = []
     if os.path.exists(path):
         with open(path) as f:
             history = json.load(f)
     record = {
-        "signal_date":   signal["signal_date"],
-        "pick":          signal["pick"],
-        "conviction":    signal["conviction"],
-        "active_agents": sum(signal.get("active_agents", {}).values()),
-        "generated_at":  signal["generated_at"],
+        "signal_date":  signal["signal_date"],
+        "pick":         signal["pick"],
+        "conviction":   signal["conviction"],
+        "generated_at": signal["generated_at"],
     }
     if record["signal_date"] not in {r["signal_date"] for r in history}:
         history.append(record)
@@ -235,7 +243,6 @@ def save_signals(sig_A=None, sig_B=None, sig_Aw=None, sig_Bw=None):
                 json.dump(sig, f, indent=2)
             if hist:
                 update_history(sig, opt)
-
     print("[predict] All signals saved.")
 
 
@@ -250,14 +257,12 @@ if __name__ == "__main__":
     sig_A = sig_B = sig_Aw = sig_Bw = None
 
     if args.option in ("A", "both"):
-        data_A = loader.get_option_data("A", master)
-        sig_A  = generate_signal("A", data_A)
-        sig_Aw = generate_window_signal("A", data_A)
+        sig_A  = generate_signal("A", master)
+        sig_Aw = generate_window_signal("A", master)
 
     if args.option in ("B", "both"):
-        data_B = loader.get_option_data("B", master)
-        sig_B  = generate_signal("B", data_B)
-        sig_Bw = generate_window_signal("B", data_B)
+        sig_B  = generate_signal("B", master)
+        sig_Bw = generate_window_signal("B", master)
 
     save_signals(sig_A, sig_B, sig_Aw, sig_Bw)
 
