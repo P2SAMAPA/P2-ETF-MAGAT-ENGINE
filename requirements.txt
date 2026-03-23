@@ -1,0 +1,6 @@
+torch
+pandas
+numpy
+pyarrow
+huggingface_hub
+pandas-market-calendars
