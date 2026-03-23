@@ -48,10 +48,10 @@ TAU             = 0.005   # soft update for target network
 LR_AGENT        = 1e-3
 REPLAY_BUFFER   = 10000
 BATCH_SIZE_RL   = 64
-MIN_REPLAY      = 500
+MIN_REPLAY      = 200
 EPSILON_START   = 1.0
 EPSILON_END     = 0.05
-EPSILON_DECAY   = 0.995
+EPSILON_DECAY   = 0.99997   # per step
 
 # ── Meta-agent ─────────────────────────────────────────────────────────────────
 META_HIDDEN_DIM = 64
@@ -61,9 +61,9 @@ TRAIN_SPLIT  = 0.70
 VAL_SPLIT    = 0.15
 # TEST = remaining 15%
 
-N_EPISODES      = 10      # passes through training data
+N_EPISODES      = 50      # enough for epsilon to decay
 MAX_STEPS_EP    = 2000    # max steps per episode (days)
-WARMUP_EPISODES = 2       # pure exploration before learning
+WARMUP_EPISODES = 3       # pure exploration before learning
 
 TRAIN_END  = "2024-12-31"
 LIVE_START = "2025-01-01"
