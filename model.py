@@ -1,16 +1,24 @@
-# model.py — MAGAT Multi-Agent Graph Attention Network
+# model.py — MAGAT Supervised Architecture
+#
+# Key difference from DeePM:
+#   DeePM: LSTM encoder per asset → fixed macro graph prior → portfolio head
+#   MAGAT: MLP encoder per asset → LEARNED GAT adjacency → portfolio head
+#
+# The GAT layer learns which assets attend to which other assets
+# purely from the data — no pre-specified macro conditioning.
+# This makes the cross-asset graph fully data-driven.
 #
 # Architecture:
-#   State: per-asset OHLCV+return window + macro context
+#   x_asset (B, n_assets, lookback, n_asset_feats)
+#   x_macro (B, lookback, n_macro_feats)
 #       ↓
-#   GATEncoder   — multi-head graph attention across all assets
-#       → node embeddings (n_assets, GAT_HIDDEN_DIM)
-#   AgentNetwork — per-asset DQN head: Q(s,a) for a ∈ {inactive, active}
-#       → Q-values (n_assets, 2)
-#   MetaAgent    — selects final ETF from active agents by highest Q-value
-#       → pick (scalar)
+#   AssetMLPEncoder  — per-asset MLP on flattened window → (B, A, GAT_HIDDEN)
+#   MacroEncoder     — linear + mean pool → (B, MACRO_HIDDEN)
+#   GATLayer × N     — learned cross-asset graph attention → (B, A, GAT_HIDDEN)
+#   PortfolioHead    — MLP → softmax over n_assets → weights (B, A)
 
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,13 +26,73 @@ import torch.nn.functional as F
 import config as cfg
 
 
+# ── Asset MLP Encoder ──────────────────────────────────────────────────────────
+
+class AssetMLPEncoder(nn.Module):
+    """
+    Encodes each asset's LOOKBACK-day feature window independently.
+    Flattens (lookback × n_feats) → MLP → hidden embedding.
+
+    Input:  (B, n_assets, lookback, n_feats)
+    Output: (B, n_assets, hidden_dim)
+    """
+
+    def __init__(self, lookback: int, n_feats: int, hidden_dim: int,
+                 dropout: float = 0.1):
+        super().__init__()
+        in_dim = lookback * n_feats
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, A, L, F = x.shape
+        x = x.view(B, A, L * F)          # flatten lookback × feats
+        x = self.net(x)                   # (B, A, hidden_dim)
+        return self.norm(x)
+
+
+# ── Macro Encoder ──────────────────────────────────────────────────────────────
+
+class MacroEncoder(nn.Module):
+    """
+    Encodes macro time series into a context vector.
+    Input:  (B, L, n_macro_feats)
+    Output: (B, macro_hidden_dim)
+    """
+
+    def __init__(self, n_macro_feats: int, hidden_dim: int,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(n_macro_feats, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)         # (B, L, hidden_dim)
+        x = x.mean(dim=1)        # mean pool over time → (B, hidden_dim)
+        return self.norm(x)
+
+
 # ── GAT Layer ─────────────────────────────────────────────────────────────────
 
 class GATLayer(nn.Module):
     """
-    Single graph attention layer.
-    Input:  x (n_assets, in_dim)
-    Output: x (n_assets, out_dim * n_heads)
+    Multi-head graph attention layer.
+    Learns which assets attend to which — fully data-driven adjacency.
+
+    Input:  x (B, n_assets, in_dim)
+    Output: x (B, n_assets, out_dim)
     """
 
     def __init__(self, in_dim: int, out_dim: int, n_heads: int = 4,
@@ -33,221 +101,192 @@ class GATLayer(nn.Module):
         self.n_heads = n_heads
         self.out_dim = out_dim
         self.concat  = concat
+        self.head_dim = out_dim // n_heads if concat else out_dim
 
-        self.W    = nn.Linear(in_dim, out_dim * n_heads, bias=False)
-        self.attn = nn.Parameter(torch.Tensor(1, n_heads, 2 * out_dim))
+        self.W    = nn.Linear(in_dim, self.head_dim * n_heads, bias=False)
+        self.attn = nn.Parameter(torch.empty(1, n_heads, 2 * self.head_dim))
         self.drop = nn.Dropout(dropout)
-        self.act  = nn.LeakyReLU(0.2)
+        self.leaky = nn.LeakyReLU(0.2)
 
         nn.init.xavier_uniform_(self.attn)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        N = x.size(0)
-        Wx = self.W(x).view(N, self.n_heads, self.out_dim)  # (N, H, D)
+        B, N, _ = x.shape
+        H, D    = self.n_heads, self.head_dim
 
-        # Attention coefficients
-        src = Wx.unsqueeze(1).expand(N, N, self.n_heads, self.out_dim)
-        tgt = Wx.unsqueeze(0).expand(N, N, self.n_heads, self.out_dim)
-        cat = torch.cat([src, tgt], dim=-1)                  # (N, N, H, 2D)
+        Wx = self.W(x).view(B, N, H, D)                      # (B, N, H, D)
 
-        # e_ij = LeakyReLU(a^T [Wh_i || Wh_j])
-        e   = self.act((cat * self.attn).sum(-1))            # (N, N, H)
-        a   = F.softmax(e, dim=1)                            # (N, N, H)
+        # Pairwise attention scores
+        src = Wx.unsqueeze(2).expand(B, N, N, H, D)          # (B, N, N, H, D)
+        tgt = Wx.unsqueeze(1).expand(B, N, N, H, D)
+        cat = torch.cat([src, tgt], dim=-1)                   # (B, N, N, H, 2D)
+
+        e   = self.leaky((cat * self.attn).sum(-1))           # (B, N, N, H)
+        a   = F.softmax(e, dim=2)                             # (B, N, N, H)
         a   = self.drop(a)
 
         # Aggregate
-        out = (a.unsqueeze(-1) * Wx.unsqueeze(0)).sum(1)     # (N, H, D)
+        out = (a.unsqueeze(-1) * Wx.unsqueeze(1)).sum(2)      # (B, N, H, D)
 
         if self.concat:
-            return out.view(N, self.n_heads * self.out_dim)  # (N, H*D)
+            out = out.view(B, N, H * D)                       # (B, N, H*D)
         else:
-            return out.mean(1)                               # (N, D)
+            out = out.mean(2)                                  # (B, N, D)
+
+        return F.elu(out)
 
 
 class GATEncoder(nn.Module):
     """
-    Stacked GAT layers for cross-asset information aggregation.
-    Input:  asset_states (n_assets, state_dim)
-    Output: node_emb     (n_assets, GAT_HIDDEN_DIM)
+    Stacked GAT layers.
+    Input:  (B, n_assets, in_dim)
+    Output: (B, n_assets, GAT_HIDDEN_DIM)
     """
 
-    def __init__(self, state_dim: int, hidden_dim: int = 64,
-                 n_heads: int = 4, n_layers: int = 2, dropout: float = 0.1):
+    def __init__(self, in_dim: int, hidden_dim: int = 64,
+                 n_heads: int = 4, n_layers: int = 2,
+                 dropout: float = 0.1):
         super().__init__()
-
         layers = []
-        in_d   = state_dim
+        d = in_dim
         for i in range(n_layers):
             is_last = (i == n_layers - 1)
             out_d   = hidden_dim
             layers.append(GATLayer(
-                in_dim=in_d,
-                out_dim=out_d // (1 if is_last else n_heads),
+                in_dim=d,
+                out_dim=out_d,
                 n_heads=n_heads,
                 dropout=dropout,
                 concat=not is_last,
             ))
-            in_d = out_d if is_last else out_d
+            d = out_d
         self.layers = nn.ModuleList(layers)
         self.norm   = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            x = F.elu(layer(x))
+            x = layer(x)
         return self.norm(x)
 
 
-# ── Per-Asset DQN Agent ────────────────────────────────────────────────────────
+# ── Portfolio Head ─────────────────────────────────────────────────────────────
 
-class AgentNetwork(nn.Module):
+class PortfolioHead(nn.Module):
     """
-    Dueling DQN head for a single asset agent.
-    Input:  node_emb (GAT_HIDDEN_DIM,) — from GAT encoder
-    Output: Q-values (2,) — Q(inactive), Q(active)
-
-    Uses dueling architecture: Q = V(s) + A(s,a) - mean(A)
+    Maps GAT embeddings + macro context to portfolio weights.
+    Input:  graph_emb (B, A, GAT_HIDDEN_DIM)
+            macro_ctx (B, MACRO_HIDDEN_DIM)
+    Output: weights   (B, A)
     """
 
-    def __init__(self, in_dim: int, hidden_dim: int = 128):
+    def __init__(self, n_assets: int, gat_hidden: int,
+                 macro_hidden: int, hidden_dim: int = 128,
+                 dropout: float = 0.2):
         super().__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
+        combined = gat_hidden + macro_hidden
+        self.head = nn.Sequential(
+            nn.Linear(combined, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-        )
-        # Value stream
-        self.value  = nn.Linear(hidden_dim // 2, 1)
-        # Advantage stream
-        self.adv    = nn.Linear(hidden_dim // 2, 2)  # 2 actions
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h   = self.shared(x)
-        V   = self.value(h)                          # (1,)
-        A   = self.adv(h)                            # (2,)
-        Q   = V + A - A.mean(dim=-1, keepdim=True)  # dueling
-        return Q
-
-
-# ── Meta-Agent ─────────────────────────────────────────────────────────────────
-
-class MetaAgent(nn.Module):
-    """
-    Selects the final ETF from active agents.
-    Takes all agent Q-values + GAT embeddings + macro context.
-    Outputs a confidence score per agent (used to rank active agents).
-    """
-
-    def __init__(self, gat_dim: int, n_macro: int, hidden_dim: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(gat_dim + n_macro, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, n_assets),
         )
 
-    def forward(self, node_emb: torch.Tensor,
+    def forward(self, graph_emb: torch.Tensor,
                 macro_ctx: torch.Tensor) -> torch.Tensor:
-        """
-        node_emb:  (n_assets, gat_dim)
-        macro_ctx: (n_macro,)
-        Returns:   (n_assets,) confidence scores
-        """
-        macro_exp = macro_ctx.unsqueeze(0).expand(node_emb.size(0), -1)
-        combined  = torch.cat([node_emb, macro_exp], dim=-1)
-        return self.net(combined).squeeze(-1)             # (n_assets,)
+        pool    = graph_emb.mean(dim=1)                       # (B, gat_hidden)
+        combined = torch.cat([pool, macro_ctx], dim=-1)       # (B, gat+macro)
+        return F.softmax(self.head(combined), dim=-1)         # (B, A)
 
 
 # ── Full MAGAT Model ───────────────────────────────────────────────────────────
 
 class MAGAT(nn.Module):
     """
-    Full Multi-Agent Graph Attention model.
-    Holds all agent networks + GAT encoder + meta-agent.
-    Used for inference (selecting the daily ETF pick).
+    MAGAT: Multi-head Attention Graph Asset Transformer (supervised).
+
+    Replaces DeePM's LSTM encoder with MLP and fixed graph prior
+    with learned GAT adjacency. Trained end-to-end with Sharpe/EVaR loss.
     """
 
     def __init__(
         self,
         n_assets: int,
-        state_dim: int,
-        n_macro: int,
-        gat_hidden: int  = 64,
-        gat_heads: int   = 4,
-        gat_layers: int  = 2,
-        dqn_hidden: int  = 128,
-        meta_hidden: int = 64,
-        dropout: float   = 0.1,
+        n_asset_feats: int,
+        n_macro_feats: int,
+        lookback: int        = 60,
+        gat_hidden: int      = 64,
+        gat_heads: int       = 4,
+        gat_layers: int      = 2,
+        macro_hidden: int    = 32,
+        port_hidden: int     = 128,
+        dropout: float       = 0.2,
     ):
         super().__init__()
         self.n_assets = n_assets
 
+        self.asset_encoder = AssetMLPEncoder(
+            lookback=lookback,
+            n_feats=n_asset_feats,
+            hidden_dim=gat_hidden,
+            dropout=dropout,
+        )
+        self.macro_encoder = MacroEncoder(
+            n_macro_feats=n_macro_feats,
+            hidden_dim=macro_hidden,
+            dropout=dropout,
+        )
         self.gat_encoder = GATEncoder(
-            state_dim=state_dim,
+            in_dim=gat_hidden,
             hidden_dim=gat_hidden,
             n_heads=gat_heads,
             n_layers=gat_layers,
             dropout=dropout,
         )
-        self.agents = nn.ModuleList([
-            AgentNetwork(gat_hidden, dqn_hidden)
-            for _ in range(n_assets)
-        ])
-        self.meta_agent = MetaAgent(gat_hidden, n_macro, meta_hidden)
+        self.portfolio_head = PortfolioHead(
+            n_assets=n_assets,
+            gat_hidden=gat_hidden,
+            macro_hidden=macro_hidden,
+            hidden_dim=port_hidden,
+            dropout=dropout,
+        )
 
-    def forward(self, asset_states: torch.Tensor,
-                macro_ctx: torch.Tensor) -> dict:
+    def forward(self, x_asset: torch.Tensor,
+                x_macro: torch.Tensor) -> torch.Tensor:
         """
-        asset_states: (n_assets, state_dim)
-        macro_ctx:    (n_macro,)
-
-        Returns dict with:
-            node_emb:   (n_assets, gat_hidden)
-            q_values:   (n_assets, 2)
-            active:     (n_assets,) bool — action=1
-            meta_scores:(n_assets,) confidence
-            pick:       int — index of selected ETF
-            weights:    (n_assets,) softmax of meta scores for active agents
+        x_asset: (B, n_assets, lookback, n_asset_feats)
+        x_macro: (B, lookback, n_macro_feats)
+        Returns: weights (B, n_assets)
         """
-        node_emb    = self.gat_encoder(asset_states)       # (A, gat_hidden)
-
-        q_values    = torch.stack([
-            agent(node_emb[i]) for i, agent in enumerate(self.agents)
-        ])                                                  # (A, 2)
-
-        actions     = q_values.argmax(dim=-1)              # (A,) 0=inactive, 1=active
-        active_mask = actions.bool()                        # (A,)
-
-        meta_scores = self.meta_agent(node_emb, macro_ctx) # (A,)
-
-        # Among active agents, pick highest meta score
-        masked_scores = meta_scores.clone()
-        masked_scores[~active_mask] = -float("inf")
-
-        # Softmax over active agents for weights
-        active_any = active_mask.any()
-        if active_any:
-            weights = F.softmax(masked_scores, dim=0)
-            pick    = int(masked_scores.argmax())
-        else:
-            # All inactive — fall back to highest Q(active) overall
-            weights = F.softmax(q_values[:, 1], dim=0)
-            pick    = int(q_values[:, 1].argmax())
-
-        return {
-            "node_emb":    node_emb,
-            "q_values":    q_values,
-            "active":      active_mask,
-            "meta_scores": meta_scores,
-            "pick":        pick,
-            "weights":     weights,
-        }
+        asset_emb = self.asset_encoder(x_asset)    # (B, A, gat_hidden)
+        macro_ctx = self.macro_encoder(x_macro)    # (B, macro_hidden)
+        graph_emb = self.gat_encoder(asset_emb)    # (B, A, gat_hidden)
+        weights   = self.portfolio_head(graph_emb, macro_ctx)  # (B, A)
+        return weights
 
 
-def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
-    """Polyak soft update for target network."""
-    for tp, sp in zip(target.parameters(), source.parameters()):
-        tp.data.copy_(tau * sp.data + (1 - tau) * tp.data)
+# ── Loss Functions ─────────────────────────────────────────────────────────────
+
+def sharpe_loss(weights: torch.Tensor, returns: torch.Tensor,
+                cash_rate: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    port_ret = (weights * returns).sum(dim=1)
+    excess   = port_ret - cash_rate
+    return -(excess.mean() / (excess.std() + eps)) * math.sqrt(252)
+
+
+def evar_loss(weights: torch.Tensor, returns: torch.Tensor,
+              cash_rate: torch.Tensor, beta: float = 0.95,
+              eps: float = 1e-6) -> torch.Tensor:
+    port_ret = (weights * returns).sum(dim=1)
+    excess   = port_ret - cash_rate
+    mean_ret = excess.mean()
+    t        = torch.tensor(1.0)
+    evar_val = t * torch.log(
+        torch.mean(torch.exp(-excess / (t + eps))) + eps
+    ) + t * math.log(1.0 / (1.0 - beta))
+    return evar_val - mean_ret * 0.5
 
 
 def count_parameters(model: nn.Module) -> int:
