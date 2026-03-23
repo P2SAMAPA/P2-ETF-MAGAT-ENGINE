@@ -192,9 +192,10 @@ def train_option(option: str) -> dict:
             if loss > 0:
                 ep_loss.append(loss)
 
+            # Decay epsilon per step not per episode
+            epsilon = max(cfg.EPSILON_END, epsilon * cfg.EPSILON_DECAY)
             state = next_state
 
-        epsilon = max(cfg.EPSILON_END, epsilon * cfg.EPSILON_DECAY)
         ep_metrics = env.episode_metrics()
 
         # Validate
