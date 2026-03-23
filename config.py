@@ -1,5 +1,7 @@
 # config.py — P2-ETF-MAGAT-ENGINE
-# Multi-Agent Graph Attention DRL Engine
+# Supervised GAT + Portfolio Head engine (no RL)
+# GAT replaces LSTM encoder from DeePM
+# Dynamic adjacency replaces fixed macro graph prior
 
 import os
 
@@ -24,46 +26,36 @@ EQ_ETFS = [
 ]
 EQ_BENCHMARK = "SPY"
 
-# ── Macro features (core 5) ────────────────────────────────────────────────────
+# ── Macro features ─────────────────────────────────────────────────────────────
 MACRO_VARS = ["VIX", "T10Y2Y", "HY_SPREAD", "USD_INDEX", "DTB3"]
 
-# ── State space ────────────────────────────────────────────────────────────────
-LOOKBACK      = 20    # shorter lookback for RL (faster environment steps)
-
-# ── Trading cost ───────────────────────────────────────────────────────────────
-# 15 bps one-way per trade (applied when ETF selection changes)
-TRADING_COST_BPS = 15
-TRADING_COST     = TRADING_COST_BPS / 10000.0   # 0.0015
+# ── Sequence ───────────────────────────────────────────────────────────────────
+LOOKBACK = 60    # trading days per sample
 
 # ── GAT config ─────────────────────────────────────────────────────────────────
-GAT_HIDDEN_DIM = 64
-GAT_N_HEADS    = 4
-GAT_DROPOUT    = 0.1
-GAT_N_LAYERS   = 2
+# Each asset's LOOKBACK-day feature vector is encoded by a per-asset MLP,
+# then GAT propagates cross-asset information
+GAT_HIDDEN_DIM  = 64
+GAT_N_HEADS     = 4
+GAT_N_LAYERS    = 2
+GAT_DROPOUT     = 0.1
 
-# ── DQN agent config ───────────────────────────────────────────────────────────
-DQN_HIDDEN_DIM  = 128
-GAMMA           = 0.99
-TAU             = 0.005   # soft update for target network
-LR_AGENT        = 1e-3
-REPLAY_BUFFER   = 10000
-BATCH_SIZE_RL   = 64
-MIN_REPLAY      = 200
-EPSILON_START   = 1.0
-EPSILON_END     = 0.05
-EPSILON_DECAY   = 0.99997   # per step
+# ── Macro encoder ──────────────────────────────────────────────────────────────
+MACRO_HIDDEN_DIM = 32
 
-# ── Meta-agent ─────────────────────────────────────────────────────────────────
-META_HIDDEN_DIM = 64
+# ── Portfolio head ─────────────────────────────────────────────────────────────
+PORT_HIDDEN_DIM = 128
 
 # ── Training ───────────────────────────────────────────────────────────────────
 TRAIN_SPLIT  = 0.70
 VAL_SPLIT    = 0.15
-# TEST = remaining 15%
 
-N_EPISODES      = 50      # enough for epsilon to decay
-MAX_STEPS_EP    = 2000    # max steps per episode (days)
-WARMUP_EPISODES = 3       # pure exploration before learning
+BATCH_SIZE   = 64
+MAX_EPOCHS   = 150
+PATIENCE     = 15
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY  = 1e-4
+DROPOUT       = 0.2
 
 TRAIN_END  = "2024-12-31"
 LIVE_START = "2025-01-01"
