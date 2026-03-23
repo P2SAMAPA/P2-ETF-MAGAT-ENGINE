@@ -1,16 +1,8 @@
-# train.py — MAGAT fixed split RL training
-#
-# Training loop:
-#   1. Initialise MAGAT + target network + replay buffer
-#   2. Run N_EPISODES through training data
-#   3. Each step: MAGAT selects ETF → env returns reward with 15bps cost
-#   4. Store transition → sample batch → update agent networks
-#   5. Validate on val set → save best model
-#   6. Evaluate on test set
+# train.py — MAGAT fixed split training (70/15/15)
 #
 # Usage:
-#   python train.py --option A
-#   python train.py --option both
+#   python train.py --option A --loss both
+#   python train.py --option both --loss both
 
 import argparse
 import json
@@ -18,105 +10,168 @@ import os
 import pickle
 import shutil
 import time
-import copy
 from datetime import datetime
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 import config as cfg
 import loader
-from model import MAGAT, soft_update, count_parameters
-from environment import TradingEnv, ReplayBuffer
+import features as feat
+from model import MAGAT, sharpe_loss, evar_loss, count_parameters
 
 os.makedirs(cfg.MODELS_DIR, exist_ok=True)
 DEVICE = torch.device("cpu")
 
 
-# ── DQN update ────────────────────────────────────────────────────────────────
+# ── Data helpers ───────────────────────────────────────────────────────────────
 
-def update_agents(
-    model: MAGAT,
-    target: MAGAT,
-    buffer: ReplayBuffer,
-    optimizer: torch.optim.Optimizer,
-) -> float:
-    if len(buffer) < cfg.MIN_REPLAY:
-        return 0.0
+def make_dataloaders(feat_dict: dict, scaler: feat.FeatureScaler) -> tuple:
+    X_asset = feat_dict["X_asset"]
+    X_macro = feat_dict["X_macro"]
+    y       = feat_dict["y"]
+    cash    = feat_dict["cash_rate"]
+    dates   = feat_dict["dates"]
 
-    batch     = buffer.sample(cfg.BATCH_SIZE_RL)
-    total_loss = 0.0
+    n       = len(dates)
+    n_train = int(n * cfg.TRAIN_SPLIT)
+    n_val   = int(n * cfg.VAL_SPLIT)
 
-    for i, agent in enumerate(model.agents):
-        # Collect transitions where this agent was selected
-        states, actions, rewards, next_states, dones = [], [], [], [], []
-        for (as_, a_), r, (ns_, nm_), d in [
-            ((b[0][0], b[0][1]), b[1], (b[3][0], b[3][1]), b[4])
-            for b in batch
-        ]:
-            if a_ == i:
-                states.append(as_[i])
-                actions.append(1)       # agent was active (action=hold)
-                rewards.append(r)
-                next_states.append(ns_[i])
-                dones.append(d)
+    Xa_tr, Xm_tr, y_tr, c_tr = X_asset[:n_train], X_macro[:n_train], y[:n_train], cash[:n_train]
+    Xa_va, Xm_va, y_va, c_va = X_asset[n_train:n_train+n_val], X_macro[n_train:n_train+n_val], \
+                                y[n_train:n_train+n_val], cash[n_train:n_train+n_val]
+    Xa_te, Xm_te, y_te, c_te = X_asset[n_train+n_val:], X_macro[n_train+n_val:], \
+                                y[n_train+n_val:], cash[n_train+n_val:]
 
-        if not states:
-            continue
+    Xa_tr_s, Xm_tr_s = scaler.fit_transform(Xa_tr, Xm_tr)
+    Xa_va_s, Xm_va_s = scaler.transform(Xa_va, Xm_va)
+    Xa_te_s, Xm_te_s = scaler.transform(Xa_te, Xm_te)
 
-        s_t  = torch.tensor(np.array(states),      dtype=torch.float32)
-        r_t  = torch.tensor(np.array(rewards),     dtype=torch.float32)
-        ns_t = torch.tensor(np.array(next_states), dtype=torch.float32)
-        d_t  = torch.tensor(np.array(dones),       dtype=torch.float32)
+    def ds(Xa, Xm, yy, cc):
+        return TensorDataset(
+            torch.tensor(Xa), torch.tensor(Xm),
+            torch.tensor(yy), torch.tensor(cc),
+        )
 
-        # Current Q
-        q_cur = agent(s_t)[:, 1]           # Q(active) for selected agent
+    train_dl = DataLoader(ds(Xa_tr_s, Xm_tr_s, y_tr, c_tr),
+                          batch_size=cfg.BATCH_SIZE, shuffle=False)
+    val_dl   = DataLoader(ds(Xa_va_s, Xm_va_s, y_va, c_va),
+                          batch_size=cfg.BATCH_SIZE, shuffle=False)
+    test_dl  = DataLoader(ds(Xa_te_s, Xm_te_s, y_te, c_te),
+                          batch_size=cfg.BATCH_SIZE, shuffle=False)
 
-        # Target Q (double DQN style)
-        with torch.no_grad():
-            q_next = target.agents[i](ns_t).max(dim=1)[0]
-        q_target = r_t + cfg.GAMMA * q_next * (1 - d_t)
-
-        loss = F.smooth_l1_loss(q_cur, q_target)
-        total_loss += loss.item()
-
-        optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
-        optimizer.step()
-
-    soft_update(target, model, cfg.TAU)
-    return total_loss / max(len(model.agents), 1)
+    test_dates = dates[n_train + n_val:]
+    return train_dl, val_dl, test_dl, test_dates
 
 
-# ── Evaluate on data split ────────────────────────────────────────────────────
+# ── Epoch helpers ──────────────────────────────────────────────────────────────
 
-def evaluate(model: MAGAT, ret: np.ndarray, ohlcv: np.ndarray,
-             macro: np.ndarray, tickers: list) -> dict:
-    env   = TradingEnv(ret, ohlcv, macro, tickers, mode="eval")
-    state = env.reset()
-    model.eval()
-
-    picks = []
-    with torch.no_grad():
-        while not env.done:
-            as_t = torch.tensor(state[0])
-            mc_t = torch.tensor(state[1])
-            out  = model(as_t, mc_t)
-            action = out["pick"]
-            state, _, done, _ = env.step(action)
-            picks.append(action)
-            if done:
-                break
-
-    metrics = env.episode_metrics()
+def train_epoch(model, dl, optimizer, loss_fn_name):
     model.train()
-    return metrics
+    total = 0.0
+    for Xa, Xm, y_b, c_b in dl:
+        optimizer.zero_grad()
+        w = model(Xa, Xm)
+        loss = sharpe_loss(w, y_b, c_b) if loss_fn_name == "sharpe" \
+               else evar_loss(w, y_b, c_b)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total += loss.item()
+    return total / len(dl)
 
 
-# ── Train one option ──────────────────────────────────────────────────────────
+def eval_epoch(model, dl, loss_fn_name):
+    model.eval()
+    all_rets = []
+    with torch.no_grad():
+        for Xa, Xm, y_b, c_b in dl:
+            w = model(Xa, Xm)
+            port_ret = (w * y_b).sum(dim=1)
+            all_rets.append(port_ret.numpy())
+    r = np.concatenate(all_rets)
+    ann_ret = float(r.mean() * 252)
+    ann_vol = float(r.std() * np.sqrt(252) + 1e-8)
+    sharpe  = ann_ret / ann_vol
+    return ann_ret, sharpe
+
+
+# ── Train one option one loss ──────────────────────────────────────────────────
+
+def train_one(option: str, loss_fn: str, feat_dict: dict,
+              data: dict) -> dict:
+    print(f"\n  Training Option {option} | loss={loss_fn}")
+
+    scaler    = feat.FeatureScaler()
+    train_dl, val_dl, test_dl, test_dates = make_dataloaders(feat_dict, scaler)
+
+    model = MAGAT(
+        n_assets=feat_dict["n_assets"],
+        n_asset_feats=feat_dict["n_asset_feats"],
+        n_macro_feats=feat_dict["n_macro_feats"],
+        lookback=cfg.LOOKBACK,
+        gat_hidden=cfg.GAT_HIDDEN_DIM,
+        gat_heads=cfg.GAT_N_HEADS,
+        gat_layers=cfg.GAT_N_LAYERS,
+        macro_hidden=cfg.MACRO_HIDDEN_DIM,
+        port_hidden=cfg.PORT_HIDDEN_DIM,
+        dropout=cfg.DROPOUT,
+    ).to(DEVICE)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.LEARNING_RATE, weight_decay=cfg.WEIGHT_DECAY
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5
+    )
+
+    model_path = os.path.join(cfg.MODELS_DIR,
+                              f"magat_option{option}_{loss_fn}_best.pt")
+    best_val   = -float("inf")
+    patience   = 0
+
+    for epoch in range(1, cfg.MAX_EPOCHS + 1):
+        train_loss          = train_epoch(model, train_dl, optimizer, loss_fn)
+        val_ann_ret, val_sh = eval_epoch(model, val_dl, loss_fn)
+        scheduler.step(val_ann_ret)
+
+        if val_ann_ret > best_val:
+            best_val = val_ann_ret
+            patience = 0
+            torch.save(model.state_dict(), model_path)
+        else:
+            patience += 1
+
+        if patience >= cfg.PATIENCE:
+            print(f"    Early stop at epoch {epoch}")
+            break
+
+        if epoch % 20 == 0:
+            print(f"    Epoch {epoch:3d} | train_loss={train_loss:.4f} "
+                  f"| val_ann_ret={val_ann_ret*100:.2f}% | val_sh={val_sh:.3f}")
+
+    # Final test eval
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    test_ann_ret, test_sharpe = eval_epoch(model, test_dl, loss_fn)
+
+    n_params = count_parameters(model)
+    print(f"  Result: test_ann_ret={test_ann_ret*100:.2f}% | "
+          f"test_sharpe={test_sharpe:.3f} | params={n_params:,}")
+
+    return {
+        "loss_fn":       loss_fn,
+        "test_ann_ret":  round(test_ann_ret, 4),
+        "test_sharpe":   round(test_sharpe, 4),
+        "model_path":    model_path,
+        "scaler":        scaler,
+        "n_params":      n_params,
+        "test_dates":    test_dates,
+    }
+
+
+# ── Train option (both loss functions) ────────────────────────────────────────
 
 def train_option(option: str) -> dict:
     t0 = time.time()
@@ -124,136 +179,55 @@ def train_option(option: str) -> dict:
     print(f"MAGAT Fixed Split — Option {'A (FI)' if option == 'A' else 'B (Equity)'}")
     print(f"{'='*60}")
 
-    master = loader.load_master()
-    data   = loader.get_option_data(option, master)
-    tickers = data["tickers"]
+    master    = loader.load_master()
+    data      = loader.get_option_data(option, master)
+    feat_dict = feat.prepare_features(data)
 
-    state_dim = data["n_asset_feats"] * cfg.LOOKBACK
-    n_macro   = data["n_macro_feats"]
+    results = {}
+    for loss_fn in ["sharpe", "evar"]:
+        results[loss_fn] = train_one(option, loss_fn, feat_dict, data)
 
-    model = MAGAT(
-        n_assets=len(tickers),
-        state_dim=state_dim,
-        n_macro=n_macro,
-        gat_hidden=cfg.GAT_HIDDEN_DIM,
-        gat_heads=cfg.GAT_N_HEADS,
-        gat_layers=cfg.GAT_N_LAYERS,
-        dqn_hidden=cfg.DQN_HIDDEN_DIM,
-        meta_hidden=cfg.META_HIDDEN_DIM,
-        dropout=cfg.GAT_DROPOUT,
-    ).to(DEVICE)
+    # Pick winner by test ann return
+    winner = max(results, key=lambda k: results[k]["test_ann_ret"])
+    best   = results[winner]
 
-    target = copy.deepcopy(model)
-    target.eval()
+    canonical = os.path.join(cfg.MODELS_DIR, f"magat_option{option}_best.pt")
+    scaler_p  = os.path.join(cfg.MODELS_DIR, f"scaler_option{option}.pkl")
+    shutil.copy2(best["model_path"], canonical)
+    with open(scaler_p, "wb") as f:
+        pickle.dump(best["scaler"], f)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.LR_AGENT)
-    buffer    = ReplayBuffer(cfg.REPLAY_BUFFER)
-    epsilon   = cfg.EPSILON_START
-
-    model_path = os.path.join(cfg.MODELS_DIR, f"magat_option{option}_best.pt")
-    best_val   = -float("inf")
-    best_metrics = {}
-
-    print(f"\n  Training {cfg.N_EPISODES} episodes | "
-          f"trading_cost={cfg.TRADING_COST_BPS}bps | "
-          f"state_dim={state_dim} | n_macro={n_macro}")
-
-    for ep in range(1, cfg.N_EPISODES + 1):
-        env   = TradingEnv(
-            data["train_ret"], data["train_ohlcv"],
-            data["train_macro"], tickers, mode="train"
-        )
-        state = env.reset()
-        ep_loss = []
-
-        while not env.done:
-            as_t = torch.tensor(state[0])
-            mc_t = torch.tensor(state[1])
-
-            # Epsilon-greedy
-            if np.random.random() < epsilon:
-                action = np.random.randint(len(tickers))
-            else:
-                with torch.no_grad():
-                    out = model(as_t, mc_t)
-                action = out["pick"]
-
-            next_state, reward, done, info = env.step(action)
-
-            # Store transition — use GAT node embedding as state
-            with torch.no_grad():
-                node_emb = model.gat_encoder(as_t).numpy()
-            buffer.push(
-                (node_emb, action), action, reward,
-                (node_emb, state[1]), done
-            )
-
-            loss = update_agents(model, target, buffer, optimizer)
-            if loss > 0:
-                ep_loss.append(loss)
-
-            # Decay epsilon per step not per episode
-            epsilon = max(cfg.EPSILON_END, epsilon * cfg.EPSILON_DECAY)
-            state = next_state
-
-        ep_metrics = env.episode_metrics()
-
-        # Validate
-        val_metrics = evaluate(
-            model, data["val_ret"], data["val_ohlcv"],
-            data["val_macro"], tickers
-        )
-
-        print(f"  Ep {ep:2d} | "
-              f"train_ret={ep_metrics.get('ann_return',0)*100:.1f}% | "
-              f"val_ret={val_metrics.get('ann_return',0)*100:.1f}% | "
-              f"val_sh={val_metrics.get('sharpe',0):.2f} | "
-              f"trades={ep_metrics.get('n_trades',0)} | "
-              f"eps={epsilon:.3f}")
-
-        if val_metrics.get("ann_return", -999) > best_val:
-            best_val     = val_metrics.get("ann_return", -999)
-            best_metrics = val_metrics
-            torch.save(model.state_dict(), model_path)
-
-    # Test evaluation
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-    test_metrics = evaluate(
-        model, data["test_ret"], data["test_ohlcv"],
-        data["test_macro"], tickers
-    )
-
-    print(f"\n  Test: ann_ret={test_metrics.get('ann_return',0)*100:.2f}% | "
-          f"sharpe={test_metrics.get('sharpe',0):.3f} | "
-          f"trades={test_metrics.get('n_trades',0)}")
-
-    n_params = count_parameters(model)
-    elapsed  = round(time.time() - t0, 1)
+    # Test period dates
+    n_total = len(feat_dict["dates"])
+    n_test  = int(n_total * (1 - cfg.TRAIN_SPLIT - cfg.VAL_SPLIT))
+    test_start = str(feat_dict["dates"][-n_test])[:10]
 
     summary = {
-        "option":          option,
-        "trained_at":      datetime.utcnow().isoformat(),
-        "elapsed_sec":     elapsed,
-        "test_ann_return": test_metrics.get("ann_return", 0),
-        "test_ann_vol":    test_metrics.get("ann_vol", 0),
-        "test_sharpe":     test_metrics.get("sharpe", 0),
-        "test_hit_rate":   test_metrics.get("hit_rate", 0),
-        "test_n_trades":   test_metrics.get("n_trades", 0),
-        "test_start":      data["test_start"],
-        "n_params":        n_params,
-        "n_assets":        len(tickers),
-        "tickers":         tickers,
-        "n_asset_feats":   data["n_asset_feats"],
-        "n_macro_feats":   data["n_macro_feats"],
-        "trading_cost_bps":cfg.TRADING_COST_BPS,
+        "option":        option,
+        "trained_at":    datetime.utcnow().isoformat(),
+        "elapsed_sec":   round(time.time() - t0, 1),
+        "winning_loss":  winner,
+        "test_ann_return": best["test_ann_ret"],
+        "test_sharpe":   best["test_sharpe"],
+        "test_start":    test_start,
+        "n_params":      best["n_params"],
+        "n_assets":      feat_dict["n_assets"],
+        "tickers":       feat_dict["tickers"],
+        "n_asset_feats": feat_dict["n_asset_feats"],
+        "n_macro_feats": feat_dict["n_macro_feats"],
+        "lookback":      cfg.LOOKBACK,
         "config": {
-            "lookback":       cfg.LOOKBACK,
-            "gat_hidden":     cfg.GAT_HIDDEN_DIM,
-            "gat_heads":      cfg.GAT_N_HEADS,
-            "gat_layers":     cfg.GAT_N_LAYERS,
-            "dqn_hidden":     cfg.DQN_HIDDEN_DIM,
-            "n_episodes":     cfg.N_EPISODES,
-            "gamma":          cfg.GAMMA,
+            "lookback":      cfg.LOOKBACK,
+            "gat_hidden":    cfg.GAT_HIDDEN_DIM,
+            "gat_heads":     cfg.GAT_N_HEADS,
+            "gat_layers":    cfg.GAT_N_LAYERS,
+            "macro_hidden":  cfg.MACRO_HIDDEN_DIM,
+            "port_hidden":   cfg.PORT_HIDDEN_DIM,
+        },
+        "all_results": {
+            k: {kk: vv for kk, vv in v.items()
+                if kk not in ("scaler", "model_path", "test_dates")}
+            for k, v in results.items()
         },
     }
 
@@ -261,7 +235,8 @@ def train_option(option: str) -> dict:
     with open(meta_path, "w") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"\n  Done in {elapsed}s | params={n_params:,}")
+    print(f"\n  Winner: {winner} | test_ann_ret={best['test_ann_ret']*100:.2f}% "
+          f"| test_sharpe={best['test_sharpe']:.3f}")
     return summary
 
 
