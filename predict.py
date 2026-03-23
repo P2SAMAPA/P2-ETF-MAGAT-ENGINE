@@ -145,7 +145,10 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
         "trained_at":      meta.get("trained_at", ""),
         "winning_loss":    meta.get("winning_loss", ""),
         "test_ann_return": meta.get("test_ann_return", 0),
-        "test_sharpe":     meta.get("test_sharpe", 0),
+        "test_ann_vol":    meta.get("test_ann_vol",    0),
+        "test_sharpe":     meta.get("test_sharpe",     0),
+        "test_max_dd":     meta.get("test_max_dd",     0),
+        "test_hit_rate":   meta.get("test_hit_rate",   0),
         "test_start":      meta.get("test_start", ""),
         "model_n_params":  meta.get("n_params", 0),
     }
