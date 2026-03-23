@@ -85,11 +85,11 @@ def train_window(window: dict, data: dict, option: str) -> dict:
                 (node_emb, state[1]), done
             )
             update_agents(model, target, buffer, optimizer)
+            # Decay epsilon per step
+            epsilon = max(cfg.EPSILON_END, epsilon * cfg.EPSILON_DECAY)
             state = next_state
 
-        epsilon = max(cfg.EPSILON_END, epsilon * cfg.EPSILON_DECAY)
-
-    # OOS evaluation
+        # OOS evaluation
     oos_metrics = evaluate(
         model, wdata["oos_ret"], wdata["oos_ohlcv"],
         wdata["oos_macro"], tickers
