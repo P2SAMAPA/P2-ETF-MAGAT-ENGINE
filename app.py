@@ -1,5 +1,5 @@
 # app.py — P2-ETF-MAGAT-ENGINE Streamlit Dashboard
-# Multi-Agent Graph Attention DRL Engine
+# Supervised GAT + Portfolio Head Engine
 # Two tabs: Option A (FI) | Option B (Equity)
 
 import json
@@ -15,8 +15,8 @@ from huggingface_hub import hf_hub_download
 import config as cfg
 
 st.set_page_config(
-    page_title="MAGAT — Multi-Agent ETF Engine",
-    page_icon="🤖",
+    page_title="MAGAT — Graph Attention ETF Engine",
+    page_icon="🔺",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -60,19 +60,6 @@ st.markdown("""
                   letter-spacing:.05em; margin-bottom:6px; }
   .metric-value { font-size:24px; font-weight:600; color:#111827; }
   .pos { color:#059669; } .neg { color:#dc2626; }
-
-  .agent-row { display:flex; align-items:center; gap:10px;
-               padding:7px 12px; border-radius:8px; margin-bottom:5px;
-               font-size:14px; }
-  .agent-active   { background:#fff7ed; border:1px solid #fed7aa; }
-  .agent-inactive { background:#f9fafb; border:1px solid #e5e7eb; color:#9ca3af; }
-  .agent-ticker   { font-weight:700; width:48px; }
-  .agent-bar-wrap { flex:1; background:#e5e7eb; border-radius:4px; height:8px; }
-  .agent-bar      { border-radius:4px; height:8px; }
-
-  .cost-badge { font-size:13px; color:#92400e; background:#fef3c7;
-                border:1px solid #fcd34d; border-radius:20px;
-                padding:3px 12px; display:inline-block; margin-bottom:14px; }
 
   .pill   { display:inline-block; padding:5px 14px; border-radius:20px;
             font-size:15px; font-weight:500; margin:3px 3px 3px 0; }
@@ -198,7 +185,6 @@ def render_hero(sig_fixed: dict, sig_window: dict, option: str):
     conviction = best.get("conviction", 0)
     sig_date   = best.get("signal_date", "—")
     gen        = best.get("generated_at", "")
-    cost_bps   = best.get("trading_cost_bps", cfg.TRADING_COST_BPS)
     try:
         gen = datetime.fromisoformat(gen).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
@@ -222,55 +208,10 @@ def render_hero(sig_fixed: dict, sig_window: dict, option: str):
       <div class="hero-conv">{conviction*100:.1f}% conviction</div>
       <div class="hero-date">Signal for {sig_date} &nbsp;·&nbsp; Generated {gen}</div>
       <div class="hero-source">Source: {source}</div>
-      <div style="margin-top:10px">
-        <span class="cost-badge">⚡ {cost_bps}bps trading cost applied</span>
-      </div>
       <div class="runner-up">{runner}</div>
       <div style="margin-top:16px">{pills}</div>
     </div>
     """, unsafe_allow_html=True)
-
-
-def render_agent_panel(signal: dict, option: str):
-    """Show which agents are active/inactive with their weights."""
-    active_agents = signal.get("active_agents", {})
-    weights       = signal.get("weights", {})
-    tickers       = cfg.FI_ETFS if option == "A" else cfg.EQ_ETFS
-
-    if not active_agents:
-        return
-
-    st.markdown("<div style='font-size:15px;font-weight:600;color:#374151;"
-                "margin-bottom:8px;'>Agent Status</div>",
-                unsafe_allow_html=True)
-
-    active_count = sum(1 for v in active_agents.values() if v)
-    st.markdown(
-        f"<div style='font-size:13px;color:#6b7280;margin-bottom:10px;'>"
-        f"{active_count}/{len(tickers)} agents active</div>",
-        unsafe_allow_html=True,
-    )
-
-    for t in sorted(tickers, key=lambda x: weights.get(x, 0), reverse=True):
-        is_active = active_agents.get(t, False)
-        w         = weights.get(t, 0.0)
-        bar_w     = int(w * 100 * 3)   # scale for visibility
-        bar_col   = "#c2410c" if is_active else "#d1d5db"
-        row_cls   = "agent-active" if is_active else "agent-inactive"
-        status    = "✓" if is_active else "–"
-
-        st.markdown(f"""
-        <div class="agent-row {row_cls}">
-          <span class="agent-ticker">{t}</span>
-          <span style="width:16px;text-align:center;">{status}</span>
-          <div class="agent-bar-wrap">
-            <div class="agent-bar" style="width:{min(bar_w,100)}%;
-                 background:{bar_col};"></div>
-          </div>
-          <span style="width:44px;text-align:right;font-size:13px;
-                color:#6b7280;">{w*100:.1f}%</span>
-        </div>
-        """, unsafe_allow_html=True)
 
 
 def render_metrics(m: dict):
@@ -279,15 +220,6 @@ def render_metrics(m: dict):
         return
     fp = lambda v: f"{v*100:.1f}%"
     c  = lambda v: "pos" if v >= 0 else "neg"
-
-    trades_html = ""
-    if "trades" in m:
-        trades_html = f"""
-        <div class="metric-box">
-          <div class="metric-label">Trades</div>
-          <div class="metric-value">{m['trades']}</div>
-        </div>"""
-
     st.markdown(f"""
     <div class="metric-row">
       <div class="metric-box">
@@ -303,10 +235,13 @@ def render_metrics(m: dict):
         <div class="metric-value {c(m.get('sh',0))}">{m.get('sh',0):.2f}</div>
       </div>
       <div class="metric-box">
+        <div class="metric-label">Max DD (peak→trough)</div>
+        <div class="metric-value neg">{fp(m.get('dd',0))}</div>
+      </div>
+      <div class="metric-box">
         <div class="metric-label">Hit Rate</div>
         <div class="metric-value">{fp(m.get('hr',0))}</div>
       </div>
-      {trades_html}
     </div>
     """, unsafe_allow_html=True)
 
@@ -348,24 +283,22 @@ def render_footnote(signal: dict, window: bool = False):
     except Exception:
         pass
 
-    cost = signal.get("trading_cost_bps", cfg.TRADING_COST_BPS)
     if window:
-        wid    = signal.get("winning_window", "?")
-        ws     = signal.get("winning_train_start", "?")
-        we     = signal.get("winning_train_end", "?")
-        ret    = signal.get("oos_ann_return", 0)
-        shr    = signal.get("oos_sharpe", 0)
-        trades = signal.get("oos_n_trades", 0)
-        detail = (f"Window {wid} ({ws}→{we}) &nbsp;·&nbsp; "
-                  f"OOS Return: {ret*100:.2f}% &nbsp;·&nbsp; Sharpe: {shr:.3f} "
-                  f"&nbsp;·&nbsp; Trades: {trades} &nbsp;·&nbsp; Cost: {cost}bps")
+        wid  = signal.get("winning_window", "?")
+        ws   = signal.get("winning_train_start", "?")
+        we   = signal.get("winning_train_end", "?")
+        loss = signal.get("winning_loss", "—")
+        ret  = signal.get("oos_ann_return", 0)
+        shr  = signal.get("oos_sharpe", 0)
+        detail = (f"Window {wid} ({ws}→{we}) &nbsp;·&nbsp; Loss: {loss} &nbsp;·&nbsp; "
+                  f"OOS Return: {ret*100:.2f}% &nbsp;·&nbsp; Sharpe: {shr:.3f}")
     else:
-        ret    = signal.get("test_ann_return", 0)
-        shr    = signal.get("test_sharpe", 0)
-        trades = signal.get("test_n_trades", 0)
-        start  = signal.get("test_start", "")
-        detail = (f"Test Return: {ret*100:.2f}% &nbsp;·&nbsp; Sharpe: {shr:.3f} "
-                  f"&nbsp;·&nbsp; Trades: {trades} &nbsp;·&nbsp; Cost: {cost}bps"
+        loss  = signal.get("winning_loss", "—")
+        ret   = signal.get("test_ann_return", 0)
+        shr   = signal.get("test_sharpe", 0)
+        start = signal.get("test_start", "")
+        detail = (f"Loss: {loss} &nbsp;·&nbsp; "
+                  f"Test Return: {ret*100:.2f}% &nbsp;·&nbsp; Sharpe: {shr:.3f}"
                   + (f" &nbsp;·&nbsp; Test from: {start}" if start else ""))
 
     st.markdown(
@@ -402,7 +335,6 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
         "signal_date":   "Date",
         "pick":          "Pick",
         "conviction":    "Conviction",
-        "active_agents": "Active Agents",
         "actual_return": "Actual Return",
         "hit":           "Hit",
     }
@@ -436,13 +368,7 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
     sigw = signals.get(f"{option}w", {})
     hist = load_history(option)
 
-    # Hero
     render_hero(sig, sigw, option)
-
-    # Agent status panel — full width
-    if sig.get("active_agents"):
-        render_agent_panel(sig, option)
-        st.markdown("---")
 
     # Periods
     n_total    = len(master) if not master.empty else 4582
@@ -455,17 +381,17 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
     # Metrics from JSON
     fw_m = {
         "ar": sig.get("test_ann_return", 0),
-        "av": sig.get("test_ann_vol", 0),
+        "av": 0,
         "sh": sig.get("test_sharpe", 0),
-        "hr": sig.get("test_hit_rate", 0),
-        "trades": sig.get("test_n_trades", 0),
+        "dd": 0,
+        "hr": 0,
     }
     sw_m = {
         "ar": sigw.get("oos_ann_return", 0),
         "av": sigw.get("oos_ann_vol", 0),
         "sh": sigw.get("oos_sharpe", 0),
+        "dd": sigw.get("oos_max_dd", 0),
         "hr": sigw.get("oos_hit_rate", 0),
-        "trades": sigw.get("oos_n_trades", 0),
     }
 
     bt_f = build_bt(sig.get("pick",  ""), master, option, start_date=test_start)
@@ -505,7 +431,6 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
         render_curve(bt_w, key=f"{option}_window")
         render_footnote(sigw, window=True)
 
-    # Signal history
     st.markdown("<div class='sec-hdr'>Signal History</div>",
                 unsafe_allow_html=True)
     render_history(hist, master)
@@ -516,10 +441,10 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
 def main():
     st.markdown(
         "<h2 style='margin-bottom:2px;color:#1a1a2e;font-size:34px;'>"
-        "MAGAT — Multi-Agent Graph Attention ETF Engine</h2>"
+        "MAGAT — Graph Attention ETF Engine</h2>"
         "<p style='color:#6b7280;font-size:16px;margin-top:0;'>"
-        "Dueling DQN agents &nbsp;·&nbsp; GAT cross-asset graph &nbsp;·&nbsp; "
-        "15bps trading cost &nbsp;·&nbsp; 8 shrinking windows</p>",
+        "MLP encoder &nbsp;·&nbsp; Learned GAT adjacency &nbsp;·&nbsp; "
+        "EVaR + Sharpe objective &nbsp;·&nbsp; 8 shrinking windows</p>",
         unsafe_allow_html=True,
     )
 
@@ -528,8 +453,8 @@ def main():
         master  = load_master()
 
     tab_a, tab_b = st.tabs([
-        "🤖  Option A — Fixed Income / Alts",
-        "🤖  Option B — Equity Sectors",
+        "🔺  Option A — Fixed Income / Alts",
+        "🔺  Option B — Equity Sectors",
     ])
 
     with tab_a:
