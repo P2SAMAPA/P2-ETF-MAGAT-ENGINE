@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 import torch
+from huggingface_hub import upload_file
 
 import config as cfg
 import loader
@@ -205,22 +206,42 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
 
 
 def update_history(signal: dict, option: str) -> None:
-    path = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
+    """Append new signal to history and upload to Hugging Face."""
+    local_path = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
     history = []
-    if os.path.exists(path):
-        with open(path) as f:
+    if os.path.exists(local_path):
+        with open(local_path) as f:
             history = json.load(f)
+
     record = {
         "signal_date":  signal["signal_date"],
         "pick":         signal["pick"],
         "conviction":   signal["conviction"],
         "generated_at": signal["generated_at"],
     }
+
     if record["signal_date"] not in {r["signal_date"] for r in history}:
         history.append(record)
-    with open(path, "w") as f:
+
+    # Save locally
+    with open(local_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"[predict] History: {len(history)} records for Option {option}")
+
+    # Upload to Hugging Face
+    try:
+        with open(local_path, "rb") as f:
+            upload_file(
+                path_or_fileobj=f,
+                path_in_repo=f"models/signal_history_{option}.json",
+                repo_id=cfg.HF_MODELS_REPO,
+                repo_type="dataset",
+                token=cfg.HF_TOKEN,
+                commit_message=f"Update signal history for Option {option} ({record['signal_date']})"
+            )
+        print(f"[predict] Uploaded history for Option {option}")
+    except Exception as e:
+        print(f"[predict] WARNING: Failed to upload history for Option {option}: {e}")
 
 
 def best_signal(sig_fixed: dict, sig_window: dict) -> dict:
@@ -233,6 +254,7 @@ def best_signal(sig_fixed: dict, sig_window: dict) -> dict:
 
 def save_signals(sig_A=None, sig_B=None, sig_Aw=None, sig_Bw=None):
     os.makedirs(cfg.MODELS_DIR, exist_ok=True)
+
     combined = {
         "generated_at":    datetime.utcnow().isoformat(),
         "option_A":        sig_A,
@@ -240,9 +262,27 @@ def save_signals(sig_A=None, sig_B=None, sig_Aw=None, sig_Bw=None):
         "option_A_window": sig_Aw,
         "option_B_window": sig_Bw,
     }
-    with open(os.path.join(cfg.MODELS_DIR, "latest_signals.json"), "w") as f:
+
+    local_combined = os.path.join(cfg.MODELS_DIR, "latest_signals.json")
+    with open(local_combined, "w") as f:
         json.dump(combined, f, indent=2)
 
+    # Upload combined signals to HF
+    try:
+        with open(local_combined, "rb") as f:
+            upload_file(
+                path_or_fileobj=f,
+                path_in_repo="models/latest_signals.json",
+                repo_id=cfg.HF_MODELS_REPO,
+                repo_type="dataset",
+                token=cfg.HF_TOKEN,
+                commit_message=f"Update latest signals ({combined['generated_at']})"
+            )
+        print("[predict] Uploaded latest_signals.json")
+    except Exception as e:
+        print(f"[predict] WARNING: Failed to upload latest_signals.json: {e}")
+
+    # Upload individual signal files
     for sig, name in [
         (sig_A,  "signal_A"),
         (sig_B,  "signal_B"),
@@ -250,16 +290,28 @@ def save_signals(sig_A=None, sig_B=None, sig_Aw=None, sig_Bw=None):
         (sig_Bw, "signal_B_window"),
     ]:
         if sig:
-            with open(os.path.join(cfg.MODELS_DIR, f"{name}.json"), "w") as f:
+            local = os.path.join(cfg.MODELS_DIR, f"{name}.json")
+            with open(local, "w") as f:
                 json.dump(sig, f, indent=2)
+            try:
+                with open(local, "rb") as f:
+                    upload_file(
+                        path_or_fileobj=f,
+                        path_in_repo=f"models/{name}.json",
+                        repo_id=cfg.HF_MODELS_REPO,
+                        repo_type="dataset",
+                        token=cfg.HF_TOKEN,
+                        commit_message=f"Update {name} signal"
+                    )
+                print(f"[predict] Uploaded {name}.json")
+            except Exception as e:
+                print(f"[predict] WARNING: Failed to upload {name}.json: {e}")
 
-    # Record BEST signal (hero pick) in history — not always fixed split
+    # Record BEST signal (hero pick) in history
     if sig_A or sig_Aw:
         update_history(best_signal(sig_A, sig_Aw), "A")
     if sig_B or sig_Bw:
         update_history(best_signal(sig_B, sig_Bw), "B")
-
-    print("[predict] All signals saved.")
 
 
 if __name__ == "__main__":
