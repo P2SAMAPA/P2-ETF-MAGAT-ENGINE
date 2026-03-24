@@ -109,20 +109,34 @@ def train_window(window: dict, feat_dict: dict, option: str,
     )
     best_oos = -float("inf")
     patience = 0
+    saved_any = False
 
     for epoch in range(1, cfg.MAX_EPOCHS + 1):
         train_epoch(model, train_dl, optimizer, loss_fn)
         oos_ann_ret, oos_sharpe, oos_vol, oos_dd, oos_hr = eval_epoch(model, oos_dl, loss_fn)
+
+        # Skip if NaN or -inf
+        if np.isnan(oos_ann_ret) or oos_ann_ret == -float("inf"):
+            print(f"    Epoch {epoch}: invalid OOS return {oos_ann_ret:.4f}, skipping improvement check")
+            continue
+
         scheduler.step(oos_ann_ret)
 
         if oos_ann_ret > best_oos:
             best_oos = oos_ann_ret
             patience = 0
             torch.save(model.state_dict(), model_path)
+            saved_any = True
         else:
             patience += 1
+
         if patience >= cfg.PATIENCE:
             break
+
+    # If no model was saved (e.g., all OOS returns were NaN or -inf), skip this window
+    if not saved_any or not os.path.exists(model_path):
+        print(f"  Window {wid}: No improvement or model file missing – skipping")
+        return None
 
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     oos_ann_ret, oos_sharpe, oos_vol, oos_dd, oos_hr = eval_epoch(model, oos_dl, loss_fn)
