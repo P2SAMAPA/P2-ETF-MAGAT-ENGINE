@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 import torch
-from huggingface_hub import upload_file
+from huggingface_hub import HfApi, hf_hub_download, upload_file   # added hf_hub_download
 
 import config as cfg
 import loader
@@ -206,13 +206,31 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
 
 
 def update_history(signal: dict, option: str) -> None:
-    """Append new signal to history and upload to Hugging Face."""
+    """
+    Append new signal to history, download existing from HF first,
+    then upload the updated history.
+    """
+    remote_path = f"models/signal_history_{option}.json"
     local_path = os.path.join(cfg.MODELS_DIR, f"signal_history_{option}.json")
     history = []
-    if os.path.exists(local_path):
-        with open(local_path) as f:
-            history = json.load(f)
 
+    # Try to download existing history from HF
+    try:
+        downloaded = hf_hub_download(
+            repo_id=cfg.HF_MODELS_REPO,
+            filename=remote_path,
+            repo_type="dataset",
+            token=cfg.HF_TOKEN,
+            local_dir=cfg.MODELS_DIR,
+            local_dir_use_symlinks=False,
+        )
+        with open(downloaded) as f:
+            history = json.load(f)
+        print(f"[predict] Loaded existing history: {len(history)} records for Option {option}")
+    except Exception as e:
+        print(f"[predict] No existing history found for Option {option}: {e}")
+
+    # Create new record
     record = {
         "signal_date":  signal["signal_date"],
         "pick":         signal["pick"],
@@ -222,26 +240,14 @@ def update_history(signal: dict, option: str) -> None:
 
     if record["signal_date"] not in {r["signal_date"] for r in history}:
         history.append(record)
+        print(f"[predict] Appended new record for {record['signal_date']}")
+    else:
+        print(f"[predict] Record for {record['signal_date']} already exists – skipping")
 
-    # Save locally
+    # Save locally (will be uploaded by upload_models.py)
     with open(local_path, "w") as f:
         json.dump(history, f, indent=2)
-    print(f"[predict] History: {len(history)} records for Option {option}")
-
-    # Upload to Hugging Face
-    try:
-        with open(local_path, "rb") as f:
-            upload_file(
-                path_or_fileobj=f,
-                path_in_repo=f"models/signal_history_{option}.json",
-                repo_id=cfg.HF_MODELS_REPO,
-                repo_type="dataset",
-                token=cfg.HF_TOKEN,
-                commit_message=f"Update signal history for Option {option} ({record['signal_date']})"
-            )
-        print(f"[predict] Uploaded history for Option {option}")
-    except Exception as e:
-        print(f"[predict] WARNING: Failed to upload history for Option {option}: {e}")
+    print(f"[predict] History saved locally: {len(history)} records for Option {option}")
 
 
 def best_signal(sig_fixed: dict, sig_window: dict) -> dict:
