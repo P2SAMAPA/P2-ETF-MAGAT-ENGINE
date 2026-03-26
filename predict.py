@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pandas_market_calendars as mcal
 import torch
-from huggingface_hub import HfApi, hf_hub_download, upload_file   # added hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, upload_file
 
 import config as cfg
 import loader
@@ -104,6 +104,23 @@ def _run_inference(model: MAGAT, scaler, X_asset, X_macro,
     return pick, conviction, weights_dict
 
 
+def _get_actual_return(pick: str, signal_date: str, master: pd.DataFrame) -> tuple:
+    """
+    Return (actual_return, hit) for the pick on the signal_date.
+    If the date is not in master or the column is missing, returns (None, None).
+    """
+    try:
+        date = pd.Timestamp(signal_date)
+        col = f"{pick}_ret"
+        if col in master.columns and date in master.index:
+            ret = master.loc[date, col]
+            if not np.isnan(ret):
+                return float(ret), bool(ret > 0)
+    except Exception:
+        pass
+    return None, None
+
+
 def generate_signal(option: str, master: pd.DataFrame) -> dict:
     print(f"\n[predict] Generating fixed split signal for Option {option}...")
 
@@ -124,6 +141,9 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
     pick, conviction, weights   = _run_inference(model, scaler, X_asset,
                                                   X_macro, meta["tickers"])
     signal_date = next_trading_day(last_date)
+
+    # Get actual return if the signal date is in the past (i.e., today or earlier)
+    actual_return, hit = _get_actual_return(pick, signal_date, master)
 
     rc = data["macro"].iloc[-1]
     regime_context = {
@@ -152,6 +172,8 @@ def generate_signal(option: str, master: pd.DataFrame) -> dict:
         "test_hit_rate":   meta.get("test_hit_rate",   0),
         "test_start":      meta.get("test_start", ""),
         "model_n_params":  meta.get("n_params", 0),
+        "actual_return":   actual_return,   # New field
+        "hit":             hit,             # New field
     }
 
 
@@ -179,6 +201,9 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
                                                   X_macro, meta["tickers"])
     signal_date = next_trading_day(last_date)
 
+    # Get actual return if the signal date is in the past
+    actual_return, hit = _get_actual_return(pick, signal_date, master)
+
     print(f"  Option {option} window: {pick} (conviction={conviction:.1%}) | "
           f"Window {meta['winning_window']}: "
           f"{meta['winning_train_start']}→{meta['winning_train_end']}")
@@ -202,6 +227,8 @@ def generate_window_signal(option: str, master: pd.DataFrame) -> dict:
         "oos_sharpe":          meta.get("oos_sharpe", 0),
         "oos_hit_rate":        meta.get("oos_hit_rate", 0),
         "oos_max_dd":          meta.get("oos_max_dd", 0),
+        "actual_return":       actual_return,   # New field
+        "hit":                 hit,             # New field
     }
 
 
@@ -236,6 +263,8 @@ def update_history(signal: dict, option: str) -> None:
         "pick":         signal["pick"],
         "conviction":   signal["conviction"],
         "generated_at": signal["generated_at"],
+        "actual_return": signal.get("actual_return"),
+        "hit":          signal.get("hit"),
     }
 
     if record["signal_date"] not in {r["signal_date"] for r in history}:
@@ -244,7 +273,7 @@ def update_history(signal: dict, option: str) -> None:
     else:
         print(f"[predict] Record for {record['signal_date']} already exists – skipping")
 
-    # Save locally (will be uploaded by upload_models.py)
+    # Save locally
     with open(local_path, "w") as f:
         json.dump(history, f, indent=2)
     print(f"[predict] History saved locally: {len(history)} records for Option {option}")
