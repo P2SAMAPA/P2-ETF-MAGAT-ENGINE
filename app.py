@@ -1,5 +1,5 @@
 # app.py — P2-ETF-MAGAT-ENGINE Streamlit Dashboard
-# Supervised GAT + Portfolio Head Engine
+# Graph-Mamba ETF Signal Engine
 # Two tabs: Option A (FI) | Option B (Equity)
 
 import json
@@ -326,8 +326,8 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
 
     if "hit" not in hist_df.columns and "actual_return" in hist_df.columns:
         hist_df["hit"] = hist_df["actual_return"].apply(
-            lambda x: "✓" if (not np.isnan(x) and x > 0)
-                      else ("✗" if not np.isnan(x) else "—")
+            lambda x: "✓" if (not pd.isna(x) and x > 0)
+                      else ("✗" if not pd.isna(x) else "—")
         )
 
     disp = hist_df.sort_values("signal_date", ascending=False).copy()
@@ -342,10 +342,12 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
     disp = disp[cols].rename(columns=col_map)
 
     if "Conviction" in disp.columns:
-        disp["Conviction"] = disp["Conviction"].apply(lambda x: f"{x*100:.1f}%")
+        disp["Conviction"] = disp["Conviction"].apply(
+            lambda x: f"{x*100:.1f}%" if isinstance(x, (int, float)) and not pd.isna(x) else "—"
+        )
     if "Actual Return" in disp.columns:
         disp["Actual Return"] = disp["Actual Return"].apply(
-            lambda x: f"{x*100:.2f}%" if not np.isnan(x) else "—"
+            lambda x: f"{x*100:.2f}%" if isinstance(x, (int, float)) and not pd.isna(x) else "—"
         )
 
     if "Hit" in disp.columns:
