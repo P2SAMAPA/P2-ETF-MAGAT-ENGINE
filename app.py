@@ -312,24 +312,26 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
         st.info("Signal history will appear after the first training run.")
         return
 
-    if "actual_return" not in hist_df.columns and not master.empty:
-        def get_ret(row):
+    # Ensure numeric columns exist
+    for col in ["actual_return", "hit"]:
+        if col not in hist_df.columns:
+            hist_df[col] = None
+
+    # Compute actual_return and hit for rows where they are missing
+    for idx, row in hist_df.iterrows():
+        if pd.isna(row.get("actual_return")):
             try:
                 date = pd.Timestamp(row["signal_date"])
-                col  = f"{row['pick']}_ret"
+                col = f"{row['pick']}_ret"
                 if col in master.columns and date in master.index:
-                    return master.loc[date, col]
+                    ret = master.loc[date, col]
+                    if not pd.isna(ret):
+                        hist_df.at[idx, "actual_return"] = float(ret)
+                        hist_df.at[idx, "hit"] = "✓" if ret > 0 else "✗"
             except Exception:
                 pass
-            return np.nan
-        hist_df["actual_return"] = hist_df.apply(get_ret, axis=1)
 
-    if "hit" not in hist_df.columns and "actual_return" in hist_df.columns:
-        hist_df["hit"] = hist_df["actual_return"].apply(
-            lambda x: "✓" if (not pd.isna(x) and x > 0)
-                      else ("✗" if not pd.isna(x) else "—")
-        )
-
+    # Now prepare display
     disp = hist_df.sort_values("signal_date", ascending=False).copy()
     col_map = {
         "signal_date":   "Date",
