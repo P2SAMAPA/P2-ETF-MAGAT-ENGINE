@@ -18,7 +18,7 @@ st.set_page_config(
     page_title="MAGAT — Graph Attention ETF Engine",
     page_icon="🔺",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 st.markdown("""
@@ -307,7 +307,7 @@ def render_footnote(signal: dict, window: bool = False):
     )
 
 
-def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
+def render_history(hist_df: pd.DataFrame, master: pd.DataFrame, debug: bool = False):
     if hist_df.empty:
         st.info("Signal history will appear after the first training run.")
         return
@@ -328,10 +328,22 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
                     if not pd.isna(ret):
                         hist_df.at[idx, "actual_return"] = float(ret)
                         hist_df.at[idx, "hit"] = "✓" if ret > 0 else "✗"
-            except Exception:
-                pass
+                    else:
+                        hist_df.at[idx, "actual_return"] = np.nan
+                        hist_df.at[idx, "hit"] = "—"
+                else:
+                    hist_df.at[idx, "actual_return"] = np.nan
+                    hist_df.at[idx, "hit"] = "—"
+            except Exception as e:
+                hist_df.at[idx, "actual_return"] = np.nan
+                hist_df.at[idx, "hit"] = "—"
 
-    # Now prepare display
+    if debug:
+        st.write("**Debug: History Lookup Results**")
+        debug_df = hist_df[["signal_date", "pick", "actual_return", "hit"]].copy()
+        st.dataframe(debug_df)
+
+    # Prepare display
     disp = hist_df.sort_values("signal_date", ascending=False).copy()
     col_map = {
         "signal_date":   "Date",
@@ -367,7 +379,7 @@ def render_history(hist_df: pd.DataFrame, master: pd.DataFrame):
 
 # ── Option renderer ────────────────────────────────────────────────────────────
 
-def render_option(option: str, signals: dict, master: pd.DataFrame):
+def render_option(option: str, signals: dict, master: pd.DataFrame, debug: bool):
     sig  = signals.get(option,       {})
     sigw = signals.get(f"{option}w", {})
     hist = load_history(option)
@@ -437,7 +449,7 @@ def render_option(option: str, signals: dict, master: pd.DataFrame):
 
     st.markdown("<div class='sec-hdr'>Signal History</div>",
                 unsafe_allow_html=True)
-    render_history(hist, master)
+    render_history(hist, master, debug)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -452,6 +464,10 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # Sidebar
+    with st.sidebar:
+        debug = st.checkbox("Debug history lookup", value=False)
+
     with st.spinner("Loading signals and data..."):
         signals = load_signals()
         master  = load_master()
@@ -462,10 +478,10 @@ def main():
     ])
 
     with tab_a:
-        render_option("A", signals, master)
+        render_option("A", signals, master, debug)
 
     with tab_b:
-        render_option("B", signals, master)
+        render_option("B", signals, master, debug)
 
     st.markdown(
         "<div style='margin-top:40px;padding-top:16px;border-top:1px solid #e5e7eb;"
