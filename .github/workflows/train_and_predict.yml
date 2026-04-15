@@ -2,7 +2,7 @@ name: MAGAT Train and Predict
 
 on:
   schedule:
-    - cron: "0 21 * * 1-5"   # 21:00 UTC Mon-Fri (before DeePM at 22:30)
+    - cron: "0 23 * * 1-5"   # 23:00 UTC Mon-Fri (before DeePM at 22:30)
   workflow_dispatch:
     inputs:
       option:
