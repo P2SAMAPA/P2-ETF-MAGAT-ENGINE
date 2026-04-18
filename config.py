@@ -21,7 +21,7 @@ FI_ETFS = [
 FI_BENCHMARK = "AGG"
 
 EQ_ETFS = [
-    "SPY", "QQQ", "XLK", "XLF", "XLE", "XLV",
+    "SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "IWM", "IWF", "XSD", "XBI", 
     "XLI", "XLY", "XLP", "XLU", "GDX", "XME",
 ]
 EQ_BENCHMARK = "SPY"
